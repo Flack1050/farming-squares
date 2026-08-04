@@ -2,9 +2,10 @@ name: Daily Contributions
 
 on:
   schedule:
-    # запускается каждый день в 09:00 UTC (поправь под себя)
-    - cron: '0 9 * * *'
-  workflow_dispatch: # можно запустить вручную из вкладки Actions
+    # запускается каждый час в окне 08:00-16:00 UTC = 13:00-21:00 по Екатеринбургу/Кургану
+    # (плюс случайная задержка внутри часа добавляет ещё около часа сверху, так что фактически охватывает до ~22:00)
+    - cron: '0 8-16 * * *'
+  workflow_dispatch:
 
 jobs:
   contribute:
@@ -20,8 +21,24 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Make random number of commits (1-6, weighted)
+      - name: Pick random hour, wait, then commit
         run: |
+          # выбираем "случайный" час на сегодня (08-16 UTC), одинаковый для всех запусков этого дня
+          TODAY=$(date -u +%Y%m%d)
+          SEED=$(echo -n "$TODAY-contrib-seed" | cksum | cut -d' ' -f1)
+          HOURPICK=$(( 8 + SEED % 9 ))
+          CURRENT_HOUR=$(date -u +%H)
+
+          if [ "$CURRENT_HOUR" != "$(printf '%02d' "$HOURPICK")" ]; then
+            echo "Не тот час (сегодня выбран $HOURPICK, сейчас $CURRENT_HOUR) — выходим"
+            exit 0
+          fi
+
+          # случайная задержка 0-59 минут внутри выбранного часа
+          SLEEP_MIN=$(( RANDOM % 60 ))
+          echo "Час подошёл ($HOURPICK UTC), ждём ещё $SLEEP_MIN минут"
+          sleep $(( SLEEP_MIN * 60 ))
+
           # веса (из 100): 1=5%, 2=9%, 3=12%, 4=26%, 5=19%, 6=29%
           R=$(( RANDOM % 100 ))
           if   [ "$R" -lt 5  ]; then COUNT=1
@@ -32,6 +49,7 @@ jobs:
           else COUNT=6
           fi
           echo "Сегодня будет $COUNT коммит(ов)"
+
           for i in $(seq 1 "$COUNT"); do
             TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             echo "$TS - commit $i/$COUNT" >> contributions.log
@@ -39,5 +57,5 @@ jobs:
             git commit -m "chore: daily update ($i/$COUNT)"
           done
 
-      - name: Push changes
-        run: git push
+          git push
+
