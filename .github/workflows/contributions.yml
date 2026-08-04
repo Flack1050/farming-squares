@@ -2,8 +2,7 @@ name: Daily Contributions
 
 on:
   schedule:
-    # запускается каждый час в окне 08:00-16:00 UTC = 13:00-21:00 по Екатеринбургу/Кургану
-    # (плюс случайная задержка внутри часа добавляет ещё около часа сверху, так что фактически охватывает до ~22:00)
+    # тикает каждый час в окне 08:00-16:00 UTC = 13:00-21:00 по Екатеринбургу/Кургану
     - cron: '0 8-16 * * *'
   workflow_dispatch:
 
@@ -21,41 +20,59 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Pick random hour, wait, then commit
+      - name: Compute today's plan and commit if it's this hour's turn
         run: |
-          # выбираем "случайный" час на сегодня (08-16 UTC), одинаковый для всех запусков этого дня
+          # ---- 1. сид, одинаковый для всех 9 запусков сегодняшнего дня ----
           TODAY=$(date -u +%Y%m%d)
           SEED=$(echo -n "$TODAY-contrib-seed" | cksum | cut -d' ' -f1)
-          HOURPICK=$(( 8 + SEED % 9 ))
-          CURRENT_HOUR=$(date -u +%H)
+          RANDOM=$SEED
 
-          if [ "$CURRENT_HOUR" != "$(printf '%02d' "$HOURPICK")" ]; then
-            echo "Не тот час (сегодня выбран $HOURPICK, сейчас $CURRENT_HOUR) — выходим"
+          # ---- 2. сколько коммитов всего сегодня (веса: 1=5% 2=9% 3=12% 4=26% 5=19% 6=29%) ----
+          R=$(( RANDOM % 100 ))
+          if   [ "$R" -lt 5  ]; then TOTAL=1
+          elif [ "$R" -lt 14 ]; then TOTAL=2
+          elif [ "$R" -lt 26 ]; then TOTAL=3
+          elif [ "$R" -lt 52 ]; then TOTAL=4
+          elif [ "$R" -lt 71 ]; then TOTAL=5
+          else TOTAL=6
+          fi
+          echo "Всего сегодня коммитов: $TOTAL"
+
+          # ---- 3. раскидываем TOTAL коммитов по 9 часовым слотам (08..16), максимум 3 в слот ----
+          SLOTS=(0 0 0 0 0 0 0 0 0)
+          placed=0
+          while [ "$placed" -lt "$TOTAL" ]; do
+            idx=$(( RANDOM % 9 ))
+            if [ "${SLOTS[$idx]}" -lt 3 ]; then
+              SLOTS[$idx]=$(( SLOTS[$idx] + 1 ))
+              placed=$(( placed + 1 ))
+            fi
+          done
+          echo "План по часам (08..16 UTC): ${SLOTS[*]}"
+
+          # ---- 4. сколько коммитов положено именно в текущий час ----
+          CURRENT_HOUR=$(date -u +%H)
+          HOUR_IDX=$(( 10#$CURRENT_HOUR - 8 ))
+          MY_COUNT=${SLOTS[$HOUR_IDX]}
+
+          if [ "$MY_COUNT" -eq 0 ]; then
+            echo "На этот час ($CURRENT_HOUR UTC) ничего не запланировано — выходим"
             exit 0
           fi
 
-          # случайная задержка 0-59 минут внутри выбранного часа
-          SLEEP_MIN=$(( RANDOM % 60 ))
-          echo "Час подошёл ($HOURPICK UTC), ждём ещё $SLEEP_MIN минут"
-          sleep $(( SLEEP_MIN * 60 ))
+          echo "В этот час ($CURRENT_HOUR UTC) делаем $MY_COUNT коммит(ов)"
 
-          # веса (из 100): 1=5%, 2=9%, 3=12%, 4=26%, 5=19%, 6=29%
-          R=$(( RANDOM % 100 ))
-          if   [ "$R" -lt 5  ]; then COUNT=1
-          elif [ "$R" -lt 14 ]; then COUNT=2
-          elif [ "$R" -lt 26 ]; then COUNT=3
-          elif [ "$R" -lt 52 ]; then COUNT=4
-          elif [ "$R" -lt 71 ]; then COUNT=5
-          else COUNT=6
-          fi
-          echo "Сегодня будет $COUNT коммит(ов)"
+          # ---- 5. делаем коммиты с небольшими случайными паузами между ними ----
+          for i in $(seq 1 "$MY_COUNT"); do
+            SLEEP_SEC=$(( RANDOM % 900 ))  # 0-15 минут паузы перед каждым коммитом
+            echo "Ждём $((SLEEP_SEC / 60)) мин перед коммитом $i/$MY_COUNT"
+            sleep "$SLEEP_SEC"
 
-          for i in $(seq 1 "$COUNT"); do
             TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            echo "$TS - commit $i/$COUNT" >> contributions.log
+            echo "$TS - commit $i/$MY_COUNT (hour $CURRENT_HOUR UTC)" >> contributions.log
             git add contributions.log
-            git commit -m "chore: daily update ($i/$COUNT)"
+            git commit -m "chore: daily update ($i/$MY_COUNT)"
+            git pull --rebase
+            git push
           done
-
-          git push
 
