@@ -1,0 +1,43 @@
+name: Daily Contributions
+
+on:
+  schedule:
+    # запускается каждый день в 09:00 UTC (поправь под себя)
+    - cron: '0 9 * * *'
+  workflow_dispatch: # можно запустить вручную из вкладки Actions
+
+jobs:
+  contribute:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Make random number of commits (1-6, weighted)
+        run: |
+          # веса (из 100): 1=5%, 2=9%, 3=12%, 4=26%, 5=19%, 6=29%
+          R=$(( RANDOM % 100 ))
+          if   [ "$R" -lt 5  ]; then COUNT=1
+          elif [ "$R" -lt 14 ]; then COUNT=2
+          elif [ "$R" -lt 26 ]; then COUNT=3
+          elif [ "$R" -lt 52 ]; then COUNT=4
+          elif [ "$R" -lt 71 ]; then COUNT=5
+          else COUNT=6
+          fi
+          echo "Сегодня будет $COUNT коммит(ов)"
+          for i in $(seq 1 "$COUNT"); do
+            TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            echo "$TS - commit $i/$COUNT" >> contributions.log
+            git add contributions.log
+            git commit -m "chore: daily update ($i/$COUNT)"
+          done
+
+      - name: Push changes
+        run: git push
