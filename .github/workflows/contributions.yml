@@ -2,16 +2,29 @@ name: Daily Contributions
 
 on:
   schedule:
-    # тикает каждый час в окне 08:00-16:00 UTC = 13:00-21:00 по Екатеринбургу/Кургану
-    - cron: '0 8-16 * * *'
+    # 13:17–22:17 по UTC+5
+    #
+    # 08:17 UTC = 13:17
+    # 09:17 UTC = 14:17
+    # ...
+    # 16:17 UTC = 21:17
+    # 17:17 UTC = 22:17 — резервный запуск для догоняния
+    - cron: '17 8-17 * * *'
+
   workflow_dispatch:
 
 permissions:
-  contents: write  # без этого GITHUB_TOKEN может не иметь прав на push
+  contents: write
+
+# Не даём двум экземплярам workflow одновременно менять state/log.
+concurrency:
+  group: daily-contributions
+  cancel-in-progress: false
 
 jobs:
   contribute:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -25,59 +38,231 @@ jobs:
           git config user.name "Flack1050"
           git config user.email "$GIT_EMAIL"
 
-      - name: Compute today's plan and commit if it's this hour's turn
+          echo "Git user: $(git config user.name)"
+          echo "Git email: $(git config user.email)"
+
+      - name: Compute today's plan and catch up missed slots
         run: |
-          # ---- 1. сид, одинаковый для всех 9 запусков сегодняшнего дня ----
+          set -e
+
+          # ==================================================
+          # 1. Текущая дата и час
+          # ==================================================
+
           TODAY=$(date -u +%Y%m%d)
-          SEED=$(echo -n "$TODAY-contrib-seed" | cksum | cut -d' ' -f1)
+          CURRENT_HOUR=$(date -u +%H)
+
+          CURRENT_HOUR_NUM=$((10#$CURRENT_HOUR))
+
+          echo "Дата UTC: $TODAY"
+          echo "Текущий час UTC: $CURRENT_HOUR"
+          echo "Текущее время UTC+5: $(date -u -d '+5 hours' '+%Y-%m-%d %H:%M:%S')"
+
+          # Работаем только с 08..17 UTC.
+          #
+          # 08..16 — обычные запуски.
+          # 17      — резервный запуск для догоняния.
+          if [ "$CURRENT_HOUR_NUM" -lt 8 ] || [ "$CURRENT_HOUR_NUM" -gt 17 ]; then
+            echo "Сейчас $CURRENT_HOUR UTC — вне рабочего окна."
+            exit 0
+          fi
+
+          # ==================================================
+          # 2. Детерминированный seed на сегодняшний день
+          # ==================================================
+
+          SEED=$(printf '%s' "$TODAY-contrib-seed" | cksum | cut -d' ' -f1)
+
           RANDOM=$SEED
 
-          # ---- 2. сколько коммитов всего сегодня (веса: 1=5% 2=9% 3=12% 4=26% 5=19% 6=29%) ----
+          echo "Seed: $SEED"
+
+          # ==================================================
+          # 3. Сколько коммитов должно быть сегодня
+          #
+          # 1 = 5%
+          # 2 = 9%
+          # 3 = 12%
+          # 4 = 26%
+          # 5 = 19%
+          # 6 = 29%
+          # ==================================================
+
           R=$(( RANDOM % 100 ))
-          if   [ "$R" -lt 5  ]; then TOTAL=1
-          elif [ "$R" -lt 14 ]; then TOTAL=2
-          elif [ "$R" -lt 26 ]; then TOTAL=3
-          elif [ "$R" -lt 52 ]; then TOTAL=4
-          elif [ "$R" -lt 71 ]; then TOTAL=5
-          else TOTAL=6
+
+          if [ "$R" -lt 5 ]; then
+            TOTAL=1
+          elif [ "$R" -lt 14 ]; then
+            TOTAL=2
+          elif [ "$R" -lt 26 ]; then
+            TOTAL=3
+          elif [ "$R" -lt 52 ]; then
+            TOTAL=4
+          elif [ "$R" -lt 71 ]; then
+            TOTAL=5
+          else
+            TOTAL=6
           fi
+
           echo "Всего сегодня коммитов: $TOTAL"
 
-          # ---- 3. раскидываем TOTAL коммитов по 9 часовым слотам (08..16), максимум 3 в слот ----
+          # ==================================================
+          # 4. Распределяем коммиты по 08..16 UTC
+          # ==================================================
+
           SLOTS=(0 0 0 0 0 0 0 0 0)
+
           placed=0
+
           while [ "$placed" -lt "$TOTAL" ]; do
             idx=$(( RANDOM % 9 ))
+
             if [ "${SLOTS[$idx]}" -lt 3 ]; then
               SLOTS[$idx]=$(( SLOTS[$idx] + 1 ))
               placed=$(( placed + 1 ))
             fi
           done
-          echo "План по часам (08..16 UTC): ${SLOTS[*]}"
 
-          # ---- 4. сколько коммитов положено именно в текущий час ----
-          CURRENT_HOUR=$(date -u +%H)
-          HOUR_IDX=$(( 10#$CURRENT_HOUR - 8 ))
-          MY_COUNT=${SLOTS[$HOUR_IDX]}
+          echo "План по часам 08..16 UTC:"
+          echo "${SLOTS[*]}"
 
-          if [ "$MY_COUNT" -eq 0 ]; then
-            echo "На этот час ($CURRENT_HOUR UTC) ничего не запланировано — выходим"
+          # ==================================================
+          # 5. Определяем, до какого слота мы дошли
+          # ==================================================
+
+          if [ "$CURRENT_HOUR_NUM" -le 16 ]; then
+            CURRENT_IDX=$(( CURRENT_HOUR_NUM - 8 ))
+          else
+            # 17 UTC — резервный запуск.
+            #
+            # На этом запуске считаем, что все реальные
+            # слоты 08..16 уже должны были наступить.
+            CURRENT_IDX=8
+          fi
+
+          echo "Текущий индекс плана: $CURRENT_IDX"
+
+          # ==================================================
+          # 6. Читаем состояние
+          # ==================================================
+
+          STATE_FILE=".contribution-state"
+
+          DONE=0
+
+          if [ -f "$STATE_FILE" ]; then
+            STATE_DATE=$(sed -n '1p' "$STATE_FILE")
+            STATE_DONE=$(sed -n '2p' "$STATE_FILE")
+
+            if [ "$STATE_DATE" = "$TODAY" ] && [[ "$STATE_DONE" =~ ^[0-9]+$ ]]; then
+              DONE=$STATE_DONE
+            else
+              echo "State относится к другому дню или повреждён."
+              echo "Начинаем сегодняшний счётчик с нуля."
+              DONE=0
+            fi
+          else
+            echo "State-файла пока нет."
+            echo "Начинаем сегодняшний счётчик с нуля."
+          fi
+
+          echo "Уже выполнено сегодня: $DONE"
+          echo "Всего должно быть сегодня: $TOTAL"
+
+          # ==================================================
+          # 7. Считаем, сколько коммитов уже должно быть
+          #    выполнено к текущему моменту
+          # ==================================================
+
+          EXPECTED=0
+
+          for ((i=0; i<=CURRENT_IDX; i++)); do
+            EXPECTED=$(( EXPECTED + SLOTS[$i] ))
+          done
+
+          echo "К этому моменту должно быть выполнено: $EXPECTED"
+
+          # ==================================================
+          # 8. Сколько нужно догнать
+          # ==================================================
+
+          TO_DO=$(( EXPECTED - DONE ))
+
+          if [ "$TO_DO" -le 0 ]; then
+            echo "Пропущенных коммитов нет."
+            echo "Ничего делать не нужно."
             exit 0
           fi
 
-          echo "В этот час ($CURRENT_HOUR UTC) делаем $MY_COUNT коммит(ов)"
+          echo "Нужно выполнить сейчас: $TO_DO"
 
-          # ---- 5. делаем коммиты с небольшими случайными паузами между ними ----
-          for i in $(seq 1 "$MY_COUNT"); do
-            SLEEP_SEC=$(( RANDOM % 900 ))  # 0-15 минут паузы перед каждым коммитом
-            echo "Ждём $((SLEEP_SEC / 60)) мин перед коммитом $i/$MY_COUNT"
+          # ==================================================
+          # 9. Создаём недостающие коммиты
+          # ==================================================
+
+          for ((i=1; i<=TO_DO; i++)); do
+
+            # Случайная пауза 0–15 минут.
+            SLEEP_SEC=$(( RANDOM % 900 ))
+
+            echo ""
+            echo "Коммит $i/$TO_DO"
+            echo "Ждём $SLEEP_SEC секунд..."
+
             sleep "$SLEEP_SEC"
 
-            TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            echo "$TS - commit $i/$MY_COUNT (hour $CURRENT_HOUR UTC)" >> contributions.log
-            git add contributions.log
-            git commit -m "chore: daily update ($i/$MY_COUNT)"
+            # ------------------------------------------------
+            # Синхронизируем репозиторий перед новым commit.
+            # ------------------------------------------------
+
             git pull --rebase
+
+            # ------------------------------------------------
+            # Увеличиваем счётчик.
+            # ------------------------------------------------
+
+            NEW_DONE=$(( DONE + 1 ))
+
+            TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+            echo "$TS - commit $NEW_DONE/$TOTAL" >> contributions.log
+
+            # ------------------------------------------------
+            # Сохраняем состояние.
+            #
+            # Формат:
+            #
+            # 20260805
+            # 2
+            #
+            # То есть:
+            # дата
+            # сколько уже сделано
+            # ------------------------------------------------
+
+            printf '%s\n%s\n' "$TODAY" "$NEW_DONE" > "$STATE_FILE"
+
+            # ------------------------------------------------
+            # Commit
+            # ------------------------------------------------
+
+            git add contributions.log "$STATE_FILE"
+
+            git commit -m "chore: daily update ($NEW_DONE/$TOTAL)"
+
+            # ------------------------------------------------
+            # Push
+            # ------------------------------------------------
+
             git push
+
+            DONE=$NEW_DONE
+
+            echo "Готово: $DONE/$TOTAL"
           done
 
+          echo ""
+          echo "========================================"
+          echo "Готово."
+          echo "Сегодня выполнено: $DONE/$TOTAL"
+          echo "========================================"
